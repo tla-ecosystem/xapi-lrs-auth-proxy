@@ -1,0 +1,73 @@
+version: '3.8'
+
+services:
+  # Single-tenant deployment
+  proxy-single:
+    build: .
+    container_name: xapi-proxy-single
+    ports:
+      - "8080:8080"
+    environment:
+      - LRS_PASSWORD=your-lrs-password
+      - JWT_SECRET=your-256-bit-secret-key-change-this-in-production
+      - LMS_API_KEY_1=your-lms-api-key
+    volumes:
+      - ./config.example.yaml:/app/config.yaml:ro
+    restart: unless-stopped
+    networks:
+      - xapi-network
+
+  # Multi-tenant deployment with PostgreSQL
+  proxy-multi:
+    build: .
+    container_name: xapi-proxy-multi
+    ports:
+      - "8081:8080"
+    environment:
+      - DB_PASSWORD=postgres-password
+      - REDIS_PASSWORD=redis-password
+    command: ["--multi-tenant", "--db", "postgresql://xapi_proxy:postgres-password@postgres:5432/xapi_proxy?sslmode=disable"]
+    depends_on:
+      - postgres
+      - redis
+    restart: unless-stopped
+    networks:
+      - xapi-network
+
+  # PostgreSQL for multi-tenant mode
+  postgres:
+    image: postgres:15-alpine
+    container_name: xapi-proxy-postgres
+    environment:
+      - POSTGRES_USER=xapi_proxy
+      - POSTGRES_PASSWORD=postgres-password
+      - POSTGRES_DB=xapi_proxy
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    ports:
+      - "5432:5432"
+    restart: unless-stopped
+    networks:
+      - xapi-network
+
+  # Redis for caching (optional but recommended)
+  redis:
+    image: redis:7-alpine
+    container_name: xapi-proxy-redis
+    command: redis-server --requirepass redis-password
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+    networks:
+      - xapi-network
+
+networks:
+  xapi-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:

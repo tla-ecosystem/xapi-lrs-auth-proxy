@@ -1,0 +1,35 @@
+# Single-Tenant Configuration Example
+# For on-premises or single-organization deployments
+
+mode: single-tenant
+
+server:
+  port: 8080
+  host: "0.0.0.0"
+
+# LRS backend configuration
+lrs:
+  endpoint: "https://lrs.example.com/xapi/"
+  username: "admin"
+  password: "${LRS_PASSWORD}"  # Use environment variable
+  connection_timeout: 30  # seconds
+  max_retries: 3
+
+# Authentication configuration
+auth:
+  jwt_secret: "${JWT_SECRET}"  # MUST be at least 32 bytes, use environment variable
+  jwt_ttl_seconds: 3600  # 1 hour
+  permission_policy: "strict"  # or "permissive"
+  
+  # LMS API keys (used by LMS to request tokens)
+  lms_api_keys:
+    - "${LMS_API_KEY_1}"
+    - "${LMS_API_KEY_2}"  # Optional: multiple LMS instances
+
+# Optional: Redis caching (improves performance)
+# redis:
+#   host: "localhost"
+#   port: 6379
+#   password: "${REDIS_PASSWORD}"
+#   db: 0
+#   cache_ttl: 300  # 5 minutes
