@@ -1,0 +1,22 @@
+# Test Configuration
+mode: single-tenant
+
+server:
+  port: 8080
+  host: "0.0.0.0"
+
+# LRS backend configuration
+lrs:
+  endpoint: "https://example.com/xapihelloworld/xapi/"
+  username: "kfffe"
+  password: "a5tred"
+  connection_timeout: 30
+  max_retries: 3
+
+# Authentication configuration
+auth:
+  jwt_secret: "test-secret-key-minimum-32-characters-long-please-change-in-production"
+  jwt_ttl_seconds: 3600
+  permission_policy: "strict"
+  lms_api_keys:
+    - "test-api-key-12345"
