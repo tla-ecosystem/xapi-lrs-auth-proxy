@@ -173,8 +173,3 @@ See `TESTING.md` for:
 - `TESTING.md` - Comprehensive testing guide
 - `docker-compose.yml` - Local development setup
 
-**For Standards Bodies:**
-- Permission scope definitions
-- cmi5 compliance mapping
-- Security analysis
-
