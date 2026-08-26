@@ -22,8 +22,9 @@ type TenantConfig struct {
 	LRSPassword      string
 	JWTSecret        []byte
 	JWTTTLSeconds    int
-	LMSAPIKeys       map[string]bool // API key -> enabled
-	PermissionPolicy string          // "strict" or "permissive"
+	LMSAPIKeys       map[string]bool   // API key -> enabled
+	PassthroughKeys  map[string]string // username -> password, full-access test/admin credentials
+	PermissionPolicy string            // "strict" or "permissive"
 }
 
 // TenantStore provides access to tenant configurations
@@ -49,6 +50,11 @@ func NewSingleTenantStore(cfg *config.Config) (*SingleTenantStore, error) {
 		apiKeys[key] = true
 	}
 
+	passthroughKeys := make(map[string]string)
+	for _, cred := range cfg.Auth.PassthroughKeys {
+		passthroughKeys[cred.Username] = cred.Password
+	}
+
 	tenantCfg := &TenantConfig{
 		TenantID:         "default",
 		Hosts:            []string{"*"}, // Accept any host
@@ -58,6 +64,7 @@ func NewSingleTenantStore(cfg *config.Config) (*SingleTenantStore, error) {
 		JWTSecret:        []byte(cfg.Auth.JWTSecret),
 		JWTTTLSeconds:    cfg.Auth.JWTTTLSeconds,
 		LMSAPIKeys:       apiKeys,
+		PassthroughKeys:  passthroughKeys,
 		PermissionPolicy: cfg.Auth.PermissionPolicy,
 	}
 

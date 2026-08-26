@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -107,7 +108,7 @@ func (h *Handler) ProxyStatements(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "POST", "PUT":
 		h.proxyStatementsWrite(w, r, tenant, claims, v)
-	case "GET":
+	case "GET", "HEAD":
 		h.proxyStatementsRead(w, r, tenant, claims, v)
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -123,6 +124,36 @@ func (h *Handler) proxyStatementsWrite(w http.ResponseWriter, r *http.Request, t
 		return
 	}
 	defer r.Body.Close()
+
+	// The xAPI spec allows statement writes with attachments to be sent as
+	// multipart/mixed (first part is the JSON statement(s), remaining parts
+	// are binary attachment content), and the "alternate request syntax"
+	// allows a statement to arrive as application/x-www-form-urlencoded. We
+	// can't safely json.Unmarshal either of those, and a partial/naive parse
+	// would either corrupt the body or silently skip permission validation.
+	// So: only attempt statement-level permission validation when the body
+	// is actually JSON; for anything else, only forward it untouched for a
+	// credential we already trust unconditionally (unrestricted-passthrough,
+	// e.g. a test/admin tool doing conformance testing) — real per-launch AU
+	// credentials still get a hard denial rather than an unvalidated write.
+	contentType := r.Header.Get("Content-Type")
+	isJSON := contentType == "" || strings.HasPrefix(strings.ToLower(contentType), "application/json")
+
+	if !isJSON {
+		if claims.Permissions.Write != "unrestricted-passthrough" {
+			log.WithFields(log.Fields{
+				"tenant_id":    tenant.TenantID,
+				"registration": claims.Registration,
+				"content_type": contentType,
+			}).Warn("Non-JSON statement write denied: cannot validate permissions on this content type")
+			http.Error(w, fmt.Sprintf("statement write denied: cannot validate permissions for Content-Type %q with this credential", contentType), http.StatusForbidden)
+			return
+		}
+		// Full-access credential — skip statement-level validation and pass
+		// the body through exactly as received.
+		h.forwardToLRS(w, r, tenant, body, nil)
+		return
+	}
 
 	// Parse statements
 	var statements []models.Statement
@@ -151,7 +182,7 @@ func (h *Handler) proxyStatementsWrite(w http.ResponseWriter, r *http.Request, t
 	}
 
 	// Forward to LRS
-	h.forwardToLRS(w, r, tenant, body)
+	h.forwardToLRS(w, r, tenant, body, nil)
 }
 
 // proxyStatementsRead handles statement reads
@@ -175,8 +206,13 @@ func (h *Handler) proxyStatementsRead(w http.ResponseWriter, r *http.Request, te
 		return
 	}
 
-	// Forward to LRS
-	h.forwardToLRS(w, r, tenant, nil)
+	// Forward to LRS. Rewrite any pagination "more" link in the response so
+	// continued paging routes back through the proxy instead of leaking the
+	// backend LRS's raw URL (and its own credential expectations) to the
+	// client.
+	h.forwardToLRS(w, r, tenant, nil, func(respBody []byte) []byte {
+		return h.rewriteMoreLink(respBody, tenant, r)
+	})
 }
 
 // ProxyState handles xAPI state endpoint
@@ -214,7 +250,59 @@ func (h *Handler) ProxyState(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Forward to LRS
-	h.forwardToLRS(w, r, tenant, body)
+	h.forwardToLRS(w, r, tenant, body, nil)
+}
+
+// ProxyActivitiesResource handles GET/HEAD /xapi/activities (the Activities
+// Resource — returns the full merged Activity Object for activityId).
+func (h *Handler) ProxyActivitiesResource(w http.ResponseWriter, r *http.Request) {
+	tenant := r.Context().Value(middleware.TenantKey).(*store.TenantConfig)
+	claims := r.Context().Value(middleware.ClaimsKey).(*models.Claims)
+
+	activityID := r.URL.Query().Get("activityId")
+	if claims.Permissions.Read != "unrestricted-passthrough" && activityID != claims.ActivityID {
+		log.WithFields(log.Fields{
+			"tenant_id": tenant.TenantID,
+		}).Warn("Activities Resource read denied: activity mismatch")
+		http.Error(w, "read denied: activity mismatch", http.StatusForbidden)
+		return
+	}
+
+	h.forwardToLRS(w, r, tenant, nil, nil)
+}
+
+// ProxyAgentsResource handles GET/HEAD /xapi/agents (the Agents Resource —
+// returns a Person Object for the given agent).
+func (h *Handler) ProxyAgentsResource(w http.ResponseWriter, r *http.Request) {
+	tenant := r.Context().Value(middleware.TenantKey).(*store.TenantConfig)
+	claims := r.Context().Value(middleware.ClaimsKey).(*models.Claims)
+
+	agent := r.URL.Query().Get("agent")
+	if claims.Permissions.Read != "unrestricted-passthrough" {
+		if agent == "" || (!strings.Contains(agent, claims.Actor.Mbox) && !strings.Contains(agent, claims.Actor.OpenID)) {
+			log.WithFields(log.Fields{
+				"tenant_id": tenant.TenantID,
+			}).Warn("Agents Resource read denied: agent mismatch")
+			http.Error(w, "read denied: agent mismatch", http.StatusForbidden)
+			return
+		}
+	}
+
+	h.forwardToLRS(w, r, tenant, nil, nil)
+}
+
+// ProxyStatementsMore handles GET/HEAD /xapi/statements/more/{id} — the
+// continuation link for a paginated GET /statements result. The client only
+// ever reaches this with a URL we handed back from rewriteMoreLink after the
+// original query was already authenticated and permission-checked, so it's
+// just forwarded.
+func (h *Handler) ProxyStatementsMore(w http.ResponseWriter, r *http.Request) {
+	tenant := r.Context().Value(middleware.TenantKey).(*store.TenantConfig)
+	// A deep pagination chain can itself contain another "more" link, so
+	// keep rewriting on every hop, not just the first page.
+	h.forwardToLRS(w, r, tenant, nil, func(respBody []byte) []byte {
+		return h.rewriteMoreLink(respBody, tenant, r)
+	})
 }
 
 // ProxyActivityProfile handles xAPI activity profile endpoint
@@ -232,7 +320,7 @@ func (h *Handler) ProxyActivityProfile(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 	}
 
-	h.forwardToLRS(w, r, tenant, body)
+	h.forwardToLRS(w, r, tenant, body, nil)
 }
 
 // ProxyAgentProfile handles xAPI agent profile endpoint
@@ -259,17 +347,70 @@ func (h *Handler) ProxyAgentProfile(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
 	}
 
-	h.forwardToLRS(w, r, tenant, body)
+	h.forwardToLRS(w, r, tenant, body, nil)
 }
 
 // ProxyAbout handles xAPI about endpoint
 func (h *Handler) ProxyAbout(w http.ResponseWriter, r *http.Request) {
 	tenant := r.Context().Value(middleware.TenantKey).(*store.TenantConfig)
-	h.forwardToLRS(w, r, tenant, nil)
+	h.forwardToLRS(w, r, tenant, nil, nil)
 }
 
-// forwardToLRS forwards the request to the tenant's LRS
-func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *store.TenantConfig, body []byte) {
+// rewriteMoreLink rewrites a GET /statements response's pagination "more"
+// link so it points back through the proxy instead of exposing the backend
+// LRS's raw endpoint URL. Only rewrites when "more" is present and actually
+// prefixed with the tenant's configured LRS endpoint (an absolute URL leak);
+// anything else (missing, empty, or already relative) is left untouched
+// rather than guessed at. Uses json.RawMessage for every other field so
+// re-marshaling can't reformat numbers or nested statement content.
+func (h *Handler) rewriteMoreLink(body []byte, tenant *store.TenantConfig, r *http.Request) []byte {
+	if !bytes.Contains(body, []byte(`"more"`)) {
+		return body
+	}
+
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(body, &result); err != nil {
+		return body
+	}
+
+	raw, ok := result["more"]
+	if !ok {
+		return body
+	}
+
+	var more string
+	if err := json.Unmarshal(raw, &more); err != nil || more == "" {
+		return body
+	}
+
+	if !strings.HasPrefix(more, tenant.LRSEndpoint) {
+		return body
+	}
+
+	scheme := "https"
+	if r.TLS == nil && strings.ToLower(r.Header.Get("X-Forwarded-Proto")) != "https" {
+		scheme = "http"
+	}
+	newMore := scheme + "://" + r.Host + "/xapi" + strings.TrimPrefix(more, tenant.LRSEndpoint)
+
+	newRaw, err := json.Marshal(newMore)
+	if err != nil {
+		return body
+	}
+	result["more"] = newRaw
+
+	out, err := json.Marshal(result)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// forwardToLRS forwards the request to the tenant's LRS. If rewriteResponse
+// is non-nil, the backend's response body is buffered and passed through it
+// before being written to the client (used to rewrite pagination links);
+// otherwise the response is streamed straight through.
+func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *store.TenantConfig, body []byte, rewriteResponse func([]byte) []byte) {
 	// Build LRS URL
 	lrsURL := tenant.LRSEndpoint + r.URL.Path[5:] // Remove "/xapi" prefix
 	if r.URL.RawQuery != "" {
@@ -326,12 +467,28 @@ func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *s
 		}
 	}
 
-	// Copy status code
-	w.WriteHeader(resp.StatusCode)
+	if rewriteResponse != nil {
+		respBody, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.WithError(err).Error("Failed to read LRS response")
+			http.Error(w, "Failed to read LRS response", http.StatusBadGateway)
+			return
+		}
+		respBody = rewriteResponse(respBody)
 
-	// Copy response body
-	if _, err := io.Copy(w, resp.Body); err != nil {
-		log.WithError(err).Error("Failed to copy LRS response")
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(respBody)))
+		w.WriteHeader(resp.StatusCode)
+		if _, err := w.Write(respBody); err != nil {
+			log.WithError(err).Error("Failed to write rewritten LRS response")
+		}
+	} else {
+		// Copy status code
+		w.WriteHeader(resp.StatusCode)
+
+		// Copy response body
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			log.WithError(err).Error("Failed to copy LRS response")
+		}
 	}
 
 	// Log successful proxy

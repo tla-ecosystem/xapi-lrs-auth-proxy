@@ -38,6 +38,20 @@ type AuthConfig struct {
 	JWTTTLSeconds  int      `yaml:"jwt_ttl_seconds"`
 	LMSAPIKeys     []string `yaml:"lms_api_keys"`
 	PermissionPolicy string `yaml:"permission_policy"` // "strict" or "permissive"
+	// PassthroughKeys are full-access, unscoped Basic Auth credentials for
+	// testing/admin tools (e.g. xAPI conformance suites) that need to talk to
+	// the proxy exactly like they'd talk to the raw LRS. Requests authenticated
+	// this way skip actor/activity/registration scoping entirely and are
+	// forwarded straight to the backend LRS. Same blast radius as the raw LRS
+	// credential — do not hand these out to real course content.
+	PassthroughKeys []PassthroughCredential `yaml:"passthrough_keys,omitempty"`
+}
+
+// PassthroughCredential is one static username/password pair accepted as
+// full-access HTTP Basic Auth on the /xapi/* routes.
+type PassthroughCredential struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
 }
 
 // DatabaseConfig contains database settings
@@ -82,7 +96,7 @@ func Load(filename string) (*Config, error) {
 		cfg.LRS.MaxRetries = 3
 	}
 	if cfg.Auth.JWTTTLSeconds == 0 {
-		cfg.Auth.JWTTTLSeconds = 3600 // 1 hour
+		cfg.Auth.JWTTTLSeconds = 14400 // 4 hours
 	}
 	if cfg.Auth.PermissionPolicy == "" {
 		cfg.Auth.PermissionPolicy = "strict"
@@ -105,6 +119,9 @@ func Load(filename string) (*Config, error) {
 	cfg.Auth.JWTSecret = expandEnv(cfg.Auth.JWTSecret)
 	cfg.Database.Password = expandEnv(cfg.Database.Password)
 	cfg.Redis.Password = expandEnv(cfg.Redis.Password)
+	for i := range cfg.Auth.PassthroughKeys {
+		cfg.Auth.PassthroughKeys[i].Password = expandEnv(cfg.Auth.PassthroughKeys[i].Password)
+	}
 
 	return &cfg, nil
 }

@@ -29,6 +29,12 @@ func (v *PermissionValidator) ValidateWrite(claims *models.Claims, stmt *models.
 	}
 
 	switch scope {
+	case "unrestricted-passthrough":
+		// Full-access test/admin credential (see PassthroughKeys) — bypasses
+		// actor/activity/registration scoping entirely, same privilege as the
+		// raw LRS credential.
+		return nil
+
 	case "actor-activity-registration-scoped":
 		return v.validateActorActivityRegistration(claims, stmt, "write")
 
@@ -50,6 +56,10 @@ func (v *PermissionValidator) ValidateRead(claims *models.Claims, query map[stri
 	}
 
 	switch scope {
+	case "unrestricted-passthrough":
+		// Full-access test/admin credential — see ValidateWrite.
+		return nil
+
 	case "actor-activity-registration-scoped":
 		return v.validateActorActivityRegistrationRead(claims, query)
 
@@ -223,6 +233,11 @@ func (v *PermissionValidator) validateGroupActivityRegistrationRead(claims *mode
 func (v *PermissionValidator) ValidateStateAccess(claims *models.Claims, activityID, agent, registration string) error {
 	// State API uses same scoping as statements
 	// Simplified validation - in production, parse full agent JSON
+
+	// Full-access test/admin credential — see ValidateWrite.
+	if claims.Permissions.Read == "unrestricted-passthrough" || claims.Permissions.Write == "unrestricted-passthrough" {
+		return nil
+	}
 
 	// Actor must match
 	if !strings.Contains(agent, claims.Actor.Mbox) &&

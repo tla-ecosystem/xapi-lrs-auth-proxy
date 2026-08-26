@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"encoding/base64"
 	"net/http"
 	"strings"
 	"time"
@@ -88,11 +89,46 @@ func JWTAuthMiddleware(next http.Handler) http.Handler {
 			return
 		}
 
-		// Parse Bearer token
+		// Parse Bearer or Basic token. Per the cmi5/xAPI Launch spec, the AU sends the
+		// fetch()-issued auth-token verbatim as "Authorization: Basic <token>" — this is
+		// NOT standard base64(username:password) Basic Auth, it's the spec's chosen wire
+		// format for an opaque, LMS-issued credential. Accept both schemes so real AUs
+		// (Storyline/Rise/ADL reference content) and Bearer-based callers (manual testing,
+		// other tooling) both work against the same token.
 		parts := strings.SplitN(auth, " ", 2)
-		if len(parts) != 2 || parts[0] != "Bearer" {
+		if len(parts) != 2 || (parts[0] != "Bearer" && parts[0] != "Basic") {
 			http.Error(w, "Invalid authorization format", http.StatusUnauthorized)
 			return
+		}
+
+		// Try full-access passthrough Basic Auth first (see PassthroughKeys in
+		// config) — a static username:password credential for test/admin tools
+		// (e.g. xAPI conformance suites), distinct from the per-launch opaque
+		// cmi5 auth-token that's also sent via "Basic". A real auth-token won't
+		// happen to base64-decode into a "user:pass" string matching a
+		// configured credential, so trying this first is safe.
+		if parts[0] == "Basic" {
+			if decoded, err := base64.StdEncoding.DecodeString(parts[1]); err == nil {
+				if idx := strings.IndexByte(string(decoded), ':'); idx >= 0 {
+					user, pass := string(decoded[:idx]), string(decoded[idx+1:])
+					if configured, ok := tenant.PassthroughKeys[user]; ok && configured == pass {
+						log.WithFields(log.Fields{
+							"tenant_id": tenant.TenantID,
+							"user":      user,
+						}).Info("Passthrough credential authenticated")
+						claims := &models.Claims{
+							TenantID: tenant.TenantID,
+							Permissions: models.Permissions{
+								Write: "unrestricted-passthrough",
+								Read:  "unrestricted-passthrough",
+							},
+						}
+						ctx := context.WithValue(r.Context(), ClaimsKey, claims)
+						next.ServeHTTP(w, r.WithContext(ctx))
+						return
+					}
+				}
+			}
 		}
 
 		tokenString := parts[1]

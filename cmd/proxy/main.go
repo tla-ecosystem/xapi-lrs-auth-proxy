@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,7 +28,25 @@ var (
 	port          = flag.Int("port", 0, "Server port (overrides config)")
 	version       = "1.0.0"
 	buildTime     = "unknown"
+
+	multiSlashRe = regexp.MustCompile(`/{2,}`)
 )
+
+// collapseSlashes normalizes repeated slashes in the request path (e.g.
+// "/xapi//statements" -> "/xapi/statements") before the router ever sees it.
+// Some clients (LRS conformance suites, tools that naively concatenate a
+// trailing-slash base URL with a leading-slash path) produce double slashes;
+// without this, gorilla/mux's default behavior is to 301-redirect to the
+// clean path, which a test suite that doesn't follow redirects just sees as
+// a failure. Fixing it here means the route is served directly instead.
+func collapseSlashes(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.Contains(r.URL.Path, "//") {
+			r.URL.Path = multiSlashRe.ReplaceAllString(r.URL.Path, "/")
+		}
+		next.ServeHTTP(w, r)
+	})
+}
 
 func main() {
 	flag.Parse()
@@ -93,11 +113,14 @@ func main() {
 	xapiRouter := r.PathPrefix("/xapi").Subrouter()
 	xapiRouter.Use(middleware.TenantMiddleware(tenantStore))
 	xapiRouter.Use(middleware.JWTAuthMiddleware)
-	xapiRouter.HandleFunc("/statements", h.ProxyStatements).Methods("POST", "PUT", "GET")
-	xapiRouter.HandleFunc("/activities/state", h.ProxyState).Methods("POST", "PUT", "GET", "DELETE")
-	xapiRouter.HandleFunc("/activities/profile", h.ProxyActivityProfile).Methods("POST", "PUT", "GET", "DELETE")
-	xapiRouter.HandleFunc("/agents/profile", h.ProxyAgentProfile).Methods("POST", "PUT", "GET", "DELETE")
-	xapiRouter.HandleFunc("/about", h.ProxyAbout).Methods("GET")
+	xapiRouter.HandleFunc("/statements", h.ProxyStatements).Methods("POST", "PUT", "GET", "HEAD")
+	xapiRouter.HandleFunc("/statements/more/{id}", h.ProxyStatementsMore).Methods("GET", "HEAD")
+	xapiRouter.HandleFunc("/activities/state", h.ProxyState).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
+	xapiRouter.HandleFunc("/activities/profile", h.ProxyActivityProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
+	xapiRouter.HandleFunc("/agents/profile", h.ProxyAgentProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
+	xapiRouter.HandleFunc("/activities", h.ProxyActivitiesResource).Methods("GET", "HEAD")
+	xapiRouter.HandleFunc("/agents", h.ProxyAgentsResource).Methods("GET", "HEAD")
+	xapiRouter.HandleFunc("/about", h.ProxyAbout).Methods("GET", "HEAD")
 
 	// Admin API (if multi-tenant)
 	if *multiTenant {
@@ -118,7 +141,7 @@ func main() {
 	addr := fmt.Sprintf(":%d", cfg.Server.Port)
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      r,
+		Handler:      collapseSlashes(r),
 		ReadTimeout:  15 * time.Second,
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
