@@ -1,9 +1,12 @@
 package middleware
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -84,6 +87,26 @@ func JWTAuthMiddleware(next http.Handler) http.Handler {
 
 		// Extract JWT from Authorization header
 		auth := r.Header.Get("Authorization")
+
+		// "Alternate request syntax" (xAPI spec, for clients like HTML forms
+		// that can't set arbitrary headers): a POST with a "method" query
+		// override and Content-Type application/x-www-form-urlencoded can
+		// carry Authorization as a form field instead of a real header. Only
+		// fall back to the body when there's no real header at all, so a
+		// normal request with a proper Authorization header is never
+		// affected by this.
+		if auth == "" && r.URL.Query().Get("method") != "" &&
+			strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "application/x-www-form-urlencoded") {
+			if bodyBytes, err := io.ReadAll(r.Body); err == nil {
+				r.Body = io.NopCloser(bytes.NewReader(bodyBytes)) // restore for the handler
+				if values, err := url.ParseQuery(string(bodyBytes)); err == nil {
+					if v := values.Get("Authorization"); v != "" {
+						auth = v
+					}
+				}
+			}
+		}
+
 		if auth == "" {
 			http.Error(w, "Authorization required", http.StatusUnauthorized)
 			return

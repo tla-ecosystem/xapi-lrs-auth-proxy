@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -132,14 +133,32 @@ func (h *Handler) proxyStatementsWrite(w http.ResponseWriter, r *http.Request, t
 	// can't safely json.Unmarshal either of those, and a partial/naive parse
 	// would either corrupt the body or silently skip permission validation.
 	// So: only attempt statement-level permission validation when the body
-	// is actually JSON; for anything else, only forward it untouched for a
-	// credential we already trust unconditionally (unrestricted-passthrough,
-	// e.g. a test/admin tool doing conformance testing) — real per-launch AU
-	// credentials still get a hard denial rather than an unvalidated write.
+	// is actually JSON; for the specific non-JSON content types the spec
+	// actually uses, only forward untouched for a credential we already
+	// trust unconditionally (unrestricted-passthrough, e.g. a test/admin
+	// tool doing conformance testing) — real per-launch AU credentials still
+	// get a hard denial rather than an unvalidated write. Anything else
+	// (including deliberately-wrong content types like multipart/form-data,
+	// which some conformance tests send specifically expecting rejection)
+	// is denied outright for every credential, same as before this feature
+	// existed — we're not a dumping ground for arbitrary content types just
+	// because a passthrough credential is in use.
 	contentType := r.Header.Get("Content-Type")
-	isJSON := contentType == "" || strings.HasPrefix(strings.ToLower(contentType), "application/json")
+	ctLower := strings.ToLower(contentType)
+	isJSON := contentType == "" || strings.HasPrefix(ctLower, "application/json")
+	isRecognizedNonJSON := strings.HasPrefix(ctLower, "multipart/mixed") ||
+		strings.HasPrefix(ctLower, "application/x-www-form-urlencoded")
 
 	if !isJSON {
+		if !isRecognizedNonJSON {
+			log.WithFields(log.Fields{
+				"tenant_id":    tenant.TenantID,
+				"registration": claims.Registration,
+				"content_type": contentType,
+			}).Warn("Statement write denied: unrecognized Content-Type")
+			http.Error(w, fmt.Sprintf("statement write denied: unrecognized Content-Type %q", contentType), http.StatusBadRequest)
+			return
+		}
 		if claims.Permissions.Write != "unrestricted-passthrough" {
 			log.WithFields(log.Fields{
 				"tenant_id":    tenant.TenantID,
@@ -149,8 +168,9 @@ func (h *Handler) proxyStatementsWrite(w http.ResponseWriter, r *http.Request, t
 			http.Error(w, fmt.Sprintf("statement write denied: cannot validate permissions for Content-Type %q with this credential", contentType), http.StatusForbidden)
 			return
 		}
-		// Full-access credential — skip statement-level validation and pass
-		// the body through exactly as received.
+		// Full-access credential and a recognized non-JSON content type —
+		// skip statement-level validation and pass the body through exactly
+		// as received.
 		h.forwardToLRS(w, r, tenant, body, nil)
 		return
 	}
@@ -358,11 +378,16 @@ func (h *Handler) ProxyAbout(w http.ResponseWriter, r *http.Request) {
 
 // rewriteMoreLink rewrites a GET /statements response's pagination "more"
 // link so it points back through the proxy instead of exposing the backend
-// LRS's raw endpoint URL. Only rewrites when "more" is present and actually
-// prefixed with the tenant's configured LRS endpoint (an absolute URL leak);
-// anything else (missing, empty, or already relative) is left untouched
-// rather than guessed at. Uses json.RawMessage for every other field so
-// re-marshaling can't reformat numbers or nested statement content.
+// LRS's raw endpoint URL. Handles two shapes seen in the wild: a fully
+// absolute URL (prefixed with the tenant's configured LRS endpoint), and a
+// root-relative path scoped to the LRS's own mount point (e.g. Veracity
+// returns "/hazready/xapi/statements/more?id=..." rather than an absolute
+// URL) — the latter matters because a client resolves a relative "more"
+// link against whatever host it's actually talking to (the proxy), so
+// leaving it untouched sends the client to a path our router never sees
+// unrewritten. Anything else (missing, empty, or unrecognized) is left
+// untouched rather than guessed at. Uses json.RawMessage for every other
+// field so re-marshaling can't reformat numbers or nested statement content.
 func (h *Handler) rewriteMoreLink(body []byte, tenant *store.TenantConfig, r *http.Request) []byte {
 	if !bytes.Contains(body, []byte(`"more"`)) {
 		return body
@@ -383,15 +408,26 @@ func (h *Handler) rewriteMoreLink(body []byte, tenant *store.TenantConfig, r *ht
 		return body
 	}
 
-	if !strings.HasPrefix(more, tenant.LRSEndpoint) {
-		return body
+	var suffix string
+	switch {
+	case strings.HasPrefix(more, tenant.LRSEndpoint):
+		suffix = strings.TrimPrefix(more, tenant.LRSEndpoint)
+	default:
+		if lrsURL, err := url.Parse(tenant.LRSEndpoint); err == nil {
+			if lrsPath := strings.TrimSuffix(lrsURL.Path, "/"); lrsPath != "" && strings.HasPrefix(more, lrsPath) {
+				suffix = strings.TrimPrefix(more, lrsPath)
+			}
+		}
+		if suffix == "" {
+			return body
+		}
 	}
 
 	scheme := "https"
 	if r.TLS == nil && strings.ToLower(r.Header.Get("X-Forwarded-Proto")) != "https" {
 		scheme = "http"
 	}
-	newMore := scheme + "://" + r.Host + "/xapi" + strings.TrimPrefix(more, tenant.LRSEndpoint)
+	newMore := scheme + "://" + r.Host + "/xapi" + suffix
 
 	newRaw, err := json.Marshal(newMore)
 	if err != nil {

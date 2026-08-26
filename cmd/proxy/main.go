@@ -109,18 +109,31 @@ func main() {
 	authRouter.Use(middleware.LMSAuthMiddleware)
 	authRouter.HandleFunc("/token", h.IssueToken).Methods("POST")
 
+	// About Resource - the xAPI spec treats About as capability discovery
+	// and this conformance suite requires it to be reachable with no
+	// Authorization header at all, so it gets its own subrouter without
+	// JWTAuthMiddleware (still tenant-scoped, since forwarding still needs
+	// to know which backend LRS to hit).
+	aboutRouter := r.PathPrefix("/xapi").Subrouter()
+	aboutRouter.Use(middleware.TenantMiddleware(tenantStore))
+	aboutRouter.HandleFunc("/about", h.ProxyAbout).Methods("GET", "HEAD")
+
 	// xAPI Proxy (content-facing) - requires JWT
 	xapiRouter := r.PathPrefix("/xapi").Subrouter()
 	xapiRouter.Use(middleware.TenantMiddleware(tenantStore))
 	xapiRouter.Use(middleware.JWTAuthMiddleware)
 	xapiRouter.HandleFunc("/statements", h.ProxyStatements).Methods("POST", "PUT", "GET", "HEAD")
+	// Pagination continuation link. Different LRS backends express this
+	// differently - Veracity uses a query parameter ("/statements/more?id=..."),
+	// others use a trailing path segment - so both shapes route to the same
+	// handler, which just forwards whatever path/query it received.
+	xapiRouter.HandleFunc("/statements/more", h.ProxyStatementsMore).Methods("GET", "HEAD")
 	xapiRouter.HandleFunc("/statements/more/{id}", h.ProxyStatementsMore).Methods("GET", "HEAD")
 	xapiRouter.HandleFunc("/activities/state", h.ProxyState).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
 	xapiRouter.HandleFunc("/activities/profile", h.ProxyActivityProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
 	xapiRouter.HandleFunc("/agents/profile", h.ProxyAgentProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
 	xapiRouter.HandleFunc("/activities", h.ProxyActivitiesResource).Methods("GET", "HEAD")
 	xapiRouter.HandleFunc("/agents", h.ProxyAgentsResource).Methods("GET", "HEAD")
-	xapiRouter.HandleFunc("/about", h.ProxyAbout).Methods("GET", "HEAD")
 
 	// Admin API (if multi-tenant)
 	if *multiTenant {
