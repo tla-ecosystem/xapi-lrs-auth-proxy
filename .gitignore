@@ -1,0 +1,7 @@
+# Local runtime config — contains real credentials, never commit.
+# Copy config.example.yaml to config.yaml and fill in real values.
+config.yaml
+
+# Build artifacts
+/lrsproxy
+/bin/

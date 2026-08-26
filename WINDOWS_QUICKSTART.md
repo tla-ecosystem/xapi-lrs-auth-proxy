@@ -165,9 +165,14 @@ lrs:
 
 auth:
   jwt_secret: "your-secret-key-minimum-32-characters-long"
-  jwt_ttl_seconds: 3600
+  jwt_ttl_seconds: 14400  # 4 hours (default if omitted)
   lms_api_keys:
     - "test-api-key-12345"
+  # Optional: full-access Basic Auth credentials for test/admin tools
+  # (e.g. xAPI conformance suites) — see config.example.yaml for details
+  # passthrough_keys:
+  #   - username: "test-admin"
+  #     password: "test-admin-password"
 ```
 
 **For production:**

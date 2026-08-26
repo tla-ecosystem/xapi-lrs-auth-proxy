@@ -18,13 +18,24 @@ lrs:
 # Authentication configuration
 auth:
   jwt_secret: "${JWT_SECRET}"  # MUST be at least 32 bytes, use environment variable
-  jwt_ttl_seconds: 3600  # 1 hour
+  jwt_ttl_seconds: 14400  # 4 hours (this is also the default if omitted)
   permission_policy: "strict"  # or "permissive"
-  
+
   # LMS API keys (used by LMS to request tokens)
   lms_api_keys:
     - "${LMS_API_KEY_1}"
     - "${LMS_API_KEY_2}"  # Optional: multiple LMS instances
+
+  # Optional: full-access Basic Auth credentials for test/admin tools (e.g.
+  # xAPI conformance suites) that need to talk to the proxy exactly like
+  # they'd talk to the raw LRS. Requests using one of these skip all
+  # actor/activity/registration scoping and are forwarded straight to the
+  # backend LRS — same blast radius as the raw LRS credential. Do NOT hand
+  # these out to real course content; use per-launch JWTs (issued via
+  # /auth/token) for that.
+  # passthrough_keys:
+  #   - username: "tlatests-admin"
+  #     password: "${TLATESTS_PASSWORD}"
 
 # Optional: Redis caching (improves performance)
 # redis:
