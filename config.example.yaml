@@ -37,6 +37,43 @@ auth:
   #   - username: "tlatests-admin"
   #     password: "${TLATESTS_PASSWORD}"
 
+# Optional: statement forwarding sink. After a statement write is accepted by
+# the backend LRS, statements whose verb is in the list below are also POSTed
+# to each destination as JSON:
+#   {"tenant_id": "...", "verb_id": "...", "statement": { ...original xAPI statement... }}
+# This is how a listener (e.g. a HazReady .NET action) gets cmi5/answered/
+# interacted statements into its own SQL for reporting, independent of which
+# LRS is actually being used. Delivery is asynchronous, in-memory, and
+# best-effort-with-retry — NOT durable. Statements still queued (not yet
+# delivered) when the proxy process stops are lost; there's no persistent
+# retry queue yet.
+# statement_forwarding:
+#   enabled: true
+#   # If omitted while enabled: true, this defaults to the standard cmi5
+#   # lifecycle verbs plus answered/interacted (see
+#   # config.DefaultCmi5ForwardingVerbs in internal/config/config.go).
+#   verbs:
+#     - "http://adlnet.gov/expapi/verbs/launched"
+#     - "http://adlnet.gov/expapi/verbs/initialized"
+#     - "http://adlnet.gov/expapi/verbs/completed"
+#     - "http://adlnet.gov/expapi/verbs/passed"
+#     - "http://adlnet.gov/expapi/verbs/failed"
+#     - "http://adlnet.gov/expapi/verbs/abandoned"
+#     - "https://w3id.org/xapi/adl/verbs/waived"
+#     - "https://w3id.org/xapi/adl/verbs/satisfied"
+#     - "http://adlnet.gov/expapi/verbs/terminated"
+#     - "http://adlnet.gov/expapi/verbs/answered"
+#     - "http://adlnet.gov/expapi/verbs/interacted"
+#   destinations:
+#     - url: "https://yourlms.example.com/Cmi5/StatementListener"
+#       # Sent as the "X-Cmi5-Forward-Secret" header so the listener can
+#       # confirm the call actually came from this proxy. Set the same value
+#       # on the HazReady side (Cmi5StatementForwardingSecret in Web.config).
+#       shared_secret: "${CMI5_FORWARD_SHARED_SECRET}"
+#       timeout_seconds: 10       # default 10 if omitted
+#       max_retries: 5            # default 5 if omitted
+#       retry_backoff_seconds: 2  # default 2 if omitted (linear backoff: 2s, 4s, 6s, ...)
+
 # Optional: Redis caching (improves performance)
 # redis:
 #   host: "localhost"

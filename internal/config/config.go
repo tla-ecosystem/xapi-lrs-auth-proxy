@@ -9,12 +9,68 @@ import (
 
 // Config represents the application configuration
 type Config struct {
-	Mode     string         `yaml:"mode"` // "single-tenant" or "multi-tenant"
-	Server   ServerConfig   `yaml:"server"`
-	LRS      LRSConfig      `yaml:"lrs,omitempty"`      // Single-tenant only
-	Auth     AuthConfig     `yaml:"auth,omitempty"`     // Single-tenant only
-	Database DatabaseConfig `yaml:"database,omitempty"` // Multi-tenant only
-	Redis    RedisConfig    `yaml:"redis,omitempty"`    // Optional caching
+	Mode                string                     `yaml:"mode"` // "single-tenant" or "multi-tenant"
+	Server              ServerConfig               `yaml:"server"`
+	LRS                 LRSConfig                  `yaml:"lrs,omitempty"`      // Single-tenant only
+	Auth                AuthConfig                 `yaml:"auth,omitempty"`     // Single-tenant only
+	Database            DatabaseConfig             `yaml:"database,omitempty"` // Multi-tenant only
+	Redis               RedisConfig                `yaml:"redis,omitempty"`    // Optional caching
+	StatementForwarding StatementForwardingConfig  `yaml:"statement_forwarding,omitempty"`
+}
+
+// StatementForwardingConfig controls the proxy's statement fan-out sink: after
+// a statement write is accepted by the backend LRS, if its verb is in Verbs,
+// the statement is also POSTed to every configured Destination. This is how
+// HazReady gets cmi5 statements into its own SQL for reporting without the
+// LRS choice mattering — the forwarding logic lives here, not in the LRS.
+//
+// Delivery is asynchronous, in-memory, best-effort-with-retry: it never blocks
+// or fails the original statement write, but it is NOT durable — statements
+// still queued (not yet delivered) when the proxy process stops are lost.
+// There's no persistent retry queue (e.g. backed by Postgres) yet; that's a
+// known gap, worth revisiting if a listener outage causing gaps in reporting
+// data becomes a real problem.
+type StatementForwardingConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Verbs is the allowlist of xAPI verb IDs (full IRIs) that get forwarded.
+	// Everything else (e.g. plain "experienced" statements a course might send)
+	// is ignored. If Enabled is true and Verbs is left empty, Load() fills in
+	// the standard cmi5 lifecycle verbs plus answered/interacted as a sensible
+	// default - see config.example.yaml for the full list and how to override it.
+	Verbs        []string             `yaml:"verbs,omitempty"`
+	Destinations []ForwardDestination `yaml:"destinations,omitempty"`
+}
+
+// ForwardDestination is one listener endpoint a matching statement gets POSTed
+// to, as JSON: {"tenant_id": "...", "verb_id": "...", "statement": { ...the
+// original xAPI statement, byte-for-byte as received... }}.
+type ForwardDestination struct {
+	URL string `yaml:"url"`
+	// SharedSecret, if set, is sent as the "X-Cmi5-Forward-Secret" header so
+	// the listener can confirm the call actually came from this proxy and not
+	// an arbitrary POST from the internet. Set the same value on both ends.
+	SharedSecret        string `yaml:"shared_secret,omitempty"`
+	TimeoutSeconds      int    `yaml:"timeout_seconds,omitempty"`
+	MaxRetries          int    `yaml:"max_retries,omitempty"`
+	RetryBackoffSeconds int    `yaml:"retry_backoff_seconds,omitempty"`
+}
+
+// DefaultCmi5ForwardingVerbs is the standard cmi5 lifecycle vocabulary plus
+// answered/interacted - the verbs actually needed for cmi5 completion/scoring
+// reporting. Used as the default when statement_forwarding.enabled is true
+// but no explicit verb list was configured.
+var DefaultCmi5ForwardingVerbs = []string{
+	"http://adlnet.gov/expapi/verbs/launched",
+	"http://adlnet.gov/expapi/verbs/initialized",
+	"http://adlnet.gov/expapi/verbs/completed",
+	"http://adlnet.gov/expapi/verbs/passed",
+	"http://adlnet.gov/expapi/verbs/failed",
+	"http://adlnet.gov/expapi/verbs/abandoned",
+	"https://w3id.org/xapi/adl/verbs/waived",
+	"https://w3id.org/xapi/adl/verbs/satisfied",
+	"http://adlnet.gov/expapi/verbs/terminated",
+	"http://adlnet.gov/expapi/verbs/answered",
+	"http://adlnet.gov/expapi/verbs/interacted",
 }
 
 // ServerConfig contains server settings
@@ -112,6 +168,22 @@ func Load(filename string) (*Config, error) {
 	}
 	if cfg.Redis.CacheTTL == 0 {
 		cfg.Redis.CacheTTL = 300 // 5 minutes
+	}
+	if cfg.StatementForwarding.Enabled && len(cfg.StatementForwarding.Verbs) == 0 {
+		cfg.StatementForwarding.Verbs = DefaultCmi5ForwardingVerbs
+	}
+	for i := range cfg.StatementForwarding.Destinations {
+		d := &cfg.StatementForwarding.Destinations[i]
+		if d.TimeoutSeconds == 0 {
+			d.TimeoutSeconds = 10
+		}
+		if d.MaxRetries == 0 {
+			d.MaxRetries = 5
+		}
+		if d.RetryBackoffSeconds == 0 {
+			d.RetryBackoffSeconds = 2
+		}
+		d.SharedSecret = expandEnv(d.SharedSecret)
 	}
 
 	// Expand environment variables

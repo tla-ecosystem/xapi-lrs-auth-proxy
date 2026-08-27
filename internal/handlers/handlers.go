@@ -14,6 +14,7 @@ import (
 	"github.com/gorilla/mux"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/inxsol/xapi-lrs-auth-proxy/internal/forwarder"
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/middleware"
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/models"
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/store"
@@ -23,12 +24,15 @@ import (
 // Handler contains all HTTP handlers
 type Handler struct {
 	tenantStore store.TenantStore
+	forwarder   *forwarder.Forwarder
 }
 
-// New creates a new Handler
-func New(tenantStore store.TenantStore) *Handler {
+// New creates a new Handler. fwd may be nil (statement forwarding disabled) -
+// MaybeForward on a nil *forwarder.Forwarder is a safe no-op.
+func New(tenantStore store.TenantStore, fwd *forwarder.Forwarder) *Handler {
 	return &Handler{
 		tenantStore: tenantStore,
+		forwarder:   fwd,
 	}
 }
 
@@ -187,6 +191,16 @@ func (h *Handler) proxyStatementsWrite(w http.ResponseWriter, r *http.Request, t
 		statements = []models.Statement{stmt}
 	}
 
+	// Parse the same body into per-statement raw JSON, index-aligned with
+	// statements above, so anything forwarded downstream (see MaybeForward
+	// below) carries the exact original bytes rather than a reserialized
+	// approximation of models.Statement (which is a simplified internal model
+	// and isn't guaranteed to round-trip every field, e.g. extensions).
+	var rawStatements []json.RawMessage
+	if err := json.Unmarshal(body, &rawStatements); err != nil {
+		rawStatements = []json.RawMessage{json.RawMessage(body)}
+	}
+
 	// Validate each statement against permissions
 	for i, stmt := range statements {
 		if err := v.ValidateWrite(claims, &stmt); err != nil {
@@ -202,7 +216,17 @@ func (h *Handler) proxyStatementsWrite(w http.ResponseWriter, r *http.Request, t
 	}
 
 	// Forward to LRS
-	h.forwardToLRS(w, r, tenant, body, nil)
+	statusCode, err := h.forwardToLRS(w, r, tenant, body, nil)
+
+	// Fan out to the statement forwarder (see internal/forwarder) only for
+	// statements the LRS actually accepted - a rejected write shouldn't show
+	// up as tracked activity in HazReady's reporting either. Best-effort and
+	// non-blocking: MaybeForward just enqueues and returns immediately.
+	if err == nil && statusCode >= 200 && statusCode < 300 && len(rawStatements) == len(statements) {
+		for i, stmt := range statements {
+			h.forwarder.MaybeForward(tenant.TenantID, stmt.Verb.ID, rawStatements[i])
+		}
+	}
 }
 
 // proxyStatementsRead handles statement reads
@@ -445,8 +469,12 @@ func (h *Handler) rewriteMoreLink(body []byte, tenant *store.TenantConfig, r *ht
 // forwardToLRS forwards the request to the tenant's LRS. If rewriteResponse
 // is non-nil, the backend's response body is buffered and passed through it
 // before being written to the client (used to rewrite pagination links);
-// otherwise the response is streamed straight through.
-func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *store.TenantConfig, body []byte, rewriteResponse func([]byte) []byte) {
+// otherwise the response is streamed straight through. Returns the LRS's
+// response status code (0 if the request never got a response at all) so
+// callers that need to know whether the write actually succeeded - e.g.
+// proxyStatementsWrite deciding whether to fan out to the statement forwarder
+// - can check it without re-parsing anything from w.
+func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *store.TenantConfig, body []byte, rewriteResponse func([]byte) []byte) (int, error) {
 	// Build LRS URL
 	lrsURL := tenant.LRSEndpoint + r.URL.Path[5:] // Remove "/xapi" prefix
 	if r.URL.RawQuery != "" {
@@ -463,7 +491,7 @@ func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *s
 	if err != nil {
 		log.WithError(err).Error("Failed to create LRS request")
 		http.Error(w, "Failed to forward request", http.StatusInternalServerError)
-		return
+		return 0, err
 	}
 
 	// Copy headers (except Authorization - we use LRS credentials)
@@ -492,7 +520,7 @@ func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *s
 	if err != nil {
 		log.WithError(err).Error("LRS request failed")
 		http.Error(w, "LRS request failed", http.StatusBadGateway)
-		return
+		return 0, err
 	}
 	defer resp.Body.Close()
 
@@ -508,7 +536,7 @@ func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *s
 		if err != nil {
 			log.WithError(err).Error("Failed to read LRS response")
 			http.Error(w, "Failed to read LRS response", http.StatusBadGateway)
-			return
+			return resp.StatusCode, err
 		}
 		respBody = rewriteResponse(respBody)
 
@@ -534,6 +562,8 @@ func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *s
 		"path":      r.URL.Path,
 		"lrs_status": resp.StatusCode,
 	}).Debug("Request proxied to LRS")
+
+	return resp.StatusCode, nil
 }
 
 // CreateTenant handles POST /admin/tenants

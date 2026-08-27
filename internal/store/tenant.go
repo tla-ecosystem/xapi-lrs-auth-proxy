@@ -25,6 +25,15 @@ type TenantConfig struct {
 	LMSAPIKeys       map[string]bool   // API key -> enabled
 	PassthroughKeys  map[string]string // username -> password, full-access test/admin credentials
 	PermissionPolicy string            // "strict" or "permissive"
+	// StatementForwarding controls fan-out of accepted statement writes to a
+	// listener (e.g. HazReady's SQL-backed reporting endpoint) - see the
+	// forwarder package. Zero value (Enabled: false) means no forwarding.
+	// NOTE: main.go currently builds one process-wide forwarder.Forwarder from
+	// the top-level config and hands it to Handler directly - this per-tenant
+	// copy isn't consulted yet. That's fine for the single-tenant deployment
+	// this runs as today; wiring per-tenant forwarding is future work if/when
+	// multi-tenant mode is actually used.
+	StatementForwarding config.StatementForwardingConfig
 }
 
 // TenantStore provides access to tenant configurations
@@ -66,6 +75,7 @@ func NewSingleTenantStore(cfg *config.Config) (*SingleTenantStore, error) {
 		LMSAPIKeys:       apiKeys,
 		PassthroughKeys:  passthroughKeys,
 		PermissionPolicy: cfg.Auth.PermissionPolicy,
+		StatementForwarding: cfg.StatementForwarding,
 	}
 
 	return &SingleTenantStore{

@@ -16,6 +16,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/config"
+	"github.com/inxsol/xapi-lrs-auth-proxy/internal/forwarder"
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/handlers"
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/middleware"
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/store"
@@ -91,8 +92,14 @@ func main() {
 		}
 	}
 
+	// Initialize the statement forwarding sink (fans accepted cmi5/answered/
+	// interacted statement writes out to a listener, e.g. HazReady's SQL
+	// reporting endpoint - see internal/forwarder). fwd is always non-nil;
+	// it's simply inert when cfg.StatementForwarding.Enabled is false.
+	fwd := forwarder.New(cfg.StatementForwarding)
+
 	// Initialize handlers
-	h := handlers.New(tenantStore)
+	h := handlers.New(tenantStore, fwd)
 
 	// Setup router
 	r := mux.NewRouter()
