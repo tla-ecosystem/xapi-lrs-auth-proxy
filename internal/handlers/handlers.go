@@ -537,8 +537,20 @@ func (h *Handler) forwardToLRS(w http.ResponseWriter, r *http.Request, tenant *s
 	}
 	defer resp.Body.Close()
 
-	// Copy response headers
+	// Copy response headers - except CORS ones. The upstream LRS may send
+	// its own Access-Control-Allow-Origin (often echoing the caller's Origin
+	// rather than "*"), and since Header.Add() appends rather than replaces,
+	// blindly copying it here stacks a second value on top of the one
+	// CORSMiddleware already set for this response, e.g.
+	// "Access-Control-Allow-Origin: *, https://localhost:44316" - which
+	// browsers reject outright as invalid ("contains multiple values, but
+	// only one is allowed"). CORSMiddleware is this proxy's single source of
+	// truth for CORS headers toward the browser, so the upstream's own
+	// versions are dropped here rather than merged.
 	for key, values := range resp.Header {
+		if strings.HasPrefix(strings.ToLower(key), "access-control-") {
+			continue
+		}
 		for _, value := range values {
 			w.Header().Add(key, value)
 		}
