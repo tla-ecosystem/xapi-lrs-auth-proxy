@@ -57,7 +57,20 @@ func (h *Handler) IssueToken(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Create JWT claims
-	expiresAt := time.Now().Add(time.Duration(tenant.JWTTTLSeconds) * time.Second)
+	// Use UTC explicitly: time.Now() returns server-local time, which on
+	// this host is Mountain Time. That local wall-clock value then gets
+	// serialized as-is into the "expires_at" JSON field below. The HazReady
+	// .NET side parses that with Json.NET's RoundtripKind handling (which
+	// preserves it as DateTimeKind.Local), then stores it in a SQL Server
+	// DATETIME column that has no timezone concept and silently drops the
+	// Kind - it comes back as Unspecified but still holding the *local*
+	// digits. When Cmi5Controller.Fetch later compares that against
+	// DateTime.UtcNow, .NET's comparison operators only look at Ticks and
+	// ignore Kind entirely, so a token that's still valid compares as
+	// already expired by roughly this server's UTC offset. Anchoring to
+	// UTC here removes the ambiguity at the source, regardless of how the
+	// downstream layers handle (or mishandle) Kind.
+	expiresAt := time.Now().UTC().Add(time.Duration(tenant.JWTTTLSeconds) * time.Second)
 	claims := &models.Claims{
 		TenantID:     tenant.TenantID,
 		Actor:        req.Actor,
@@ -69,7 +82,7 @@ func (h *Handler) IssueToken(w http.ResponseWriter, r *http.Request) {
 		Metadata:     req.Metadata,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
-			IssuedAt:  jwt.NewNumericDate(time.Now()),
+			IssuedAt:  jwt.NewNumericDate(time.Now().UTC()),
 			Issuer:    "xapi-lrs-auth-proxy",
 			Subject:   req.Actor.Mbox,
 		},

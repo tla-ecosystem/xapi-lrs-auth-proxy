@@ -129,18 +129,34 @@ func main() {
 	xapiRouter := r.PathPrefix("/xapi").Subrouter()
 	xapiRouter.Use(middleware.TenantMiddleware(tenantStore))
 	xapiRouter.Use(middleware.JWTAuthMiddleware)
-	xapiRouter.HandleFunc("/statements", h.ProxyStatements).Methods("POST", "PUT", "GET", "HEAD")
+	// OPTIONS is added to every one of these Methods() lists below, even
+	// though no handler here does anything for it, purely so a CORS
+	// preflight actually MATCHES the route. Without it, gorilla/mux treats
+	// an OPTIONS request to e.g. "/activities/state" as a method mismatch
+	// on that route, and whether the router-level CORSMiddleware (which
+	// short-circuits OPTIONS with a 200 + the Access-Control-* headers, see
+	// middleware.go) still gets a chance to run for that mismatch depends on
+	// subrouter middleware-composition details that aren't worth relying on.
+	// A browser AU calling these directly (State/Statements/etc. from
+	// TinCan.js, cmi5.js) sends a real preflight because Authorization is a
+	// non-simple header - if that preflight doesn't come back with CORS
+	// headers, the browser blocks the real request before it's ever sent,
+	// which surfaces client-side as exactly the symptom this was chasing:
+	// the actual GET/PUT never appears to complete, xhr.status stays 0, and
+	// nothing about it reaches the server's own logs (this proxy's or
+	// HazReady's) because the browser never let the request through.
+	xapiRouter.HandleFunc("/statements", h.ProxyStatements).Methods("POST", "PUT", "GET", "HEAD", "OPTIONS")
 	// Pagination continuation link. Different LRS backends express this
 	// differently - Veracity uses a query parameter ("/statements/more?id=..."),
 	// others use a trailing path segment - so both shapes route to the same
 	// handler, which just forwards whatever path/query it received.
-	xapiRouter.HandleFunc("/statements/more", h.ProxyStatementsMore).Methods("GET", "HEAD")
-	xapiRouter.HandleFunc("/statements/more/{id}", h.ProxyStatementsMore).Methods("GET", "HEAD")
-	xapiRouter.HandleFunc("/activities/state", h.ProxyState).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
-	xapiRouter.HandleFunc("/activities/profile", h.ProxyActivityProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
-	xapiRouter.HandleFunc("/agents/profile", h.ProxyAgentProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD")
-	xapiRouter.HandleFunc("/activities", h.ProxyActivitiesResource).Methods("GET", "HEAD")
-	xapiRouter.HandleFunc("/agents", h.ProxyAgentsResource).Methods("GET", "HEAD")
+	xapiRouter.HandleFunc("/statements/more", h.ProxyStatementsMore).Methods("GET", "HEAD", "OPTIONS")
+	xapiRouter.HandleFunc("/statements/more/{id}", h.ProxyStatementsMore).Methods("GET", "HEAD", "OPTIONS")
+	xapiRouter.HandleFunc("/activities/state", h.ProxyState).Methods("POST", "PUT", "GET", "DELETE", "HEAD", "OPTIONS")
+	xapiRouter.HandleFunc("/activities/profile", h.ProxyActivityProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD", "OPTIONS")
+	xapiRouter.HandleFunc("/agents/profile", h.ProxyAgentProfile).Methods("POST", "PUT", "GET", "DELETE", "HEAD", "OPTIONS")
+	xapiRouter.HandleFunc("/activities", h.ProxyActivitiesResource).Methods("GET", "HEAD", "OPTIONS")
+	xapiRouter.HandleFunc("/agents", h.ProxyAgentsResource).Methods("GET", "HEAD", "OPTIONS")
 
 	// Admin API (if multi-tenant)
 	if *multiTenant {

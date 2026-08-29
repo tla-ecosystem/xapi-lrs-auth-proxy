@@ -29,6 +29,19 @@ const (
 func TenantMiddleware(tenantStore store.TenantStore) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// A CORS preflight (OPTIONS) never carries a tenant-identifying
+			// Authorization header and shouldn't need to - it's just the
+			// browser asking permission to send the real request. The
+			// router-level CORSMiddleware is meant to answer these before
+			// they get this far, but that depends on gorilla/mux's exact
+			// middleware-composition order for a subrouter's Use() versus
+			// the root router's Use(); this guard makes the outcome correct
+			// either way instead of depending on it.
+			if r.Method == http.MethodOptions {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			tenant, err := tenantStore.GetByHost(r.Context(), r.Host)
 			if err != nil {
 				log.WithFields(log.Fields{
@@ -49,6 +62,14 @@ func TenantMiddleware(tenantStore store.TenantStore) func(http.Handler) http.Han
 // LMSAuthMiddleware validates LMS API key
 func LMSAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// See the matching guard in TenantMiddleware above - lets an OPTIONS
+		// preflight through without requiring the tenant context or an
+		// Authorization header it was never going to carry.
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		tenant := r.Context().Value(TenantKey).(*store.TenantConfig)
 
 		// Extract API key from Authorization header
@@ -83,6 +104,18 @@ func LMSAuthMiddleware(next http.Handler) http.Handler {
 // JWTAuthMiddleware validates JWT token
 func JWTAuthMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// See the matching guard in TenantMiddleware above - lets an OPTIONS
+		// preflight through without requiring the tenant context or an
+		// Authorization header it was never going to carry. This is the one
+		// that matters most in practice: every cross-origin call an AU makes
+		// (State, Statements, Activity Profile, ...) goes through this
+		// middleware, and a browser will only send the real request if the
+		// preflight for it succeeds.
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
 		tenant := r.Context().Value(TenantKey).(*store.TenantConfig)
 
 		// Extract JWT from Authorization header
