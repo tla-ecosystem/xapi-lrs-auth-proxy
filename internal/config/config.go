@@ -39,6 +39,13 @@ type StatementForwardingConfig struct {
 	// default - see config.example.yaml for the full list and how to override it.
 	Verbs        []string             `yaml:"verbs,omitempty"`
 	Destinations []ForwardDestination `yaml:"destinations,omitempty"`
+	// QueueDBPath is where the durable delivery queue's SQLite file lives
+	// (see internal/forwarder/store.go). Relative paths resolve against the
+	// process's working directory, same as CONFIG_FILE - defaults to
+	// "forward_queue.db" if left blank while Enabled is true. Only ever
+	// created/opened when Enabled is true and at least one Destination is
+	// configured, so enabling this feature is what actually creates the file.
+	QueueDBPath string `yaml:"queue_db_path,omitempty"`
 }
 
 // ForwardDestination is one listener endpoint a matching statement gets POSTed
@@ -171,6 +178,9 @@ func Load(filename string) (*Config, error) {
 	}
 	if cfg.StatementForwarding.Enabled && len(cfg.StatementForwarding.Verbs) == 0 {
 		cfg.StatementForwarding.Verbs = DefaultCmi5ForwardingVerbs
+	}
+	if cfg.StatementForwarding.Enabled && cfg.StatementForwarding.QueueDBPath == "" {
+		cfg.StatementForwarding.QueueDBPath = "forward_queue.db"
 	}
 	for i := range cfg.StatementForwarding.Destinations {
 		d := &cfg.StatementForwarding.Destinations[i]

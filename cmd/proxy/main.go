@@ -96,7 +96,7 @@ func main() {
 	// interacted statement writes out to a listener, e.g. HazReady's SQL
 	// reporting endpoint - see internal/forwarder). fwd is always non-nil;
 	// it's simply inert when cfg.StatementForwarding.Enabled is false.
-	fwd := forwarder.New(cfg.StatementForwarding)
+	fwd := forwarder.New(cfg.StatementForwarding, cfg.StatementForwarding.QueueDBPath)
 
 	// Initialize handlers
 	h := handlers.New(tenantStore, fwd)

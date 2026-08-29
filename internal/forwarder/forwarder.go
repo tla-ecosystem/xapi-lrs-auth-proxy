@@ -7,13 +7,24 @@
 // unchanged, since it operates on the statement bytes the proxy already has,
 // not on any LRS-specific feature.
 //
-// Delivery is asynchronous and best-effort-with-retry, not durable: a single
-// background worker drains an in-memory queue, retrying each destination with
-// linear backoff up to its configured MaxRetries before giving up and logging
-// the failure. Statements still queued when the process exits are lost — there
-// is no persistent/replayable queue (e.g. backed by Postgres) yet. It never
-// blocks or fails the original statement write; that write to the real LRS is
-// the transaction of record, this is strictly a side effect of it succeeding.
+// Delivery is asynchronous and durable: MaybeForward writes each job to a
+// local SQLite queue (see store.go) before returning, and a single background
+// worker polls that queue, retrying each job with linear backoff up to its
+// destination's configured MaxRetries before marking it permanently failed.
+// Because the queue is a file next to the binary rather than an in-memory
+// channel, a job that's still pending when the process is killed or crashes
+// is picked back up on the next start — nothing queued is lost to a restart.
+// (It's still not durable against the disk/machine itself being lost; see
+// store.go's OpenStore for the WAL/synchronous tradeoff that was chosen.)
+// It never blocks or fails the original statement write; that write to the
+// real LRS is the transaction of record, this is strictly a side effect of
+// it succeeding.
+//
+// Delivery is at-least-once, not exactly-once: a crash between "listener
+// returned 200" and "queue row marked delivered" replays that statement on
+// the next start. Listener endpoints must tolerate receiving the same
+// statement twice (e.g. upsert-or-ignore keyed on the statement's own xAPI
+// id) rather than assuming each POST is new.
 package forwarder
 
 import (
@@ -30,66 +41,94 @@ import (
 	"github.com/inxsol/xapi-lrs-auth-proxy/internal/config"
 )
 
-// queueCapacity bounds how many not-yet-delivered statements can be buffered
-// in memory. If the queue fills up (a sustained listener outage plus a burst
-// of activity), newer statements are dropped rather than blocking statement
-// writes to the LRS — the drop is logged loudly so it's visible in
-// `journalctl -u lrsproxy`.
-const queueCapacity = 2000
+// pollInterval is how often the worker checks the queue when it was empty
+// (or everything found was still in its backoff window) on the last pass.
+const pollInterval = 2 * time.Second
 
-type job struct {
-	tenantID  string
-	verbID    string
-	statement json.RawMessage
-}
+// pruneInterval and pruneRetention control the periodic cleanup of old
+// delivered rows, so a long-lived healthy deployment doesn't grow the queue
+// file forever.
+const pruneInterval = 1 * time.Hour
+const pruneRetention = 7 * 24 * time.Hour
+
+// claimBatchSize bounds how many rows the worker reads per poll pass.
+const claimBatchSize = 50
 
 // Forwarder owns the verb allowlist, destination list, and delivery queue. A
 // nil *Forwarder is valid and MaybeForward on it is a no-op, so callers don't
-// need to nil-check before use.
+// need to nil-check before use. A non-nil Forwarder with a nil store is also
+// a safe no-op — that's what New returns when forwarding is disabled, or
+// when the queue file couldn't be opened (see New below); either way this
+// package never takes down the rest of the proxy over a forwarding problem.
 type Forwarder struct {
-	cfg    config.StatementForwardingConfig
-	queue  chan job
-	client *http.Client
+	cfg       config.StatementForwardingConfig
+	store     *Store
+	destByURL map[string]config.ForwardDestination
+	client    *http.Client
 }
 
-// New creates a Forwarder from config and, if enabled, starts its background
-// delivery worker. Safe to call even when cfg.Enabled is false — MaybeForward
-// will just be a no-op.
-func New(cfg config.StatementForwardingConfig) *Forwarder {
+// New creates a Forwarder from config and, if enabled, opens its durable
+// queue and starts the background delivery worker. Safe to call even when
+// cfg.Enabled is false — MaybeForward will just be a no-op. Never returns an
+// error: statement forwarding is a side effect of a successful LRS write,
+// not a precondition for the proxy to run, so a problem opening the queue
+// file (permissions, disk full) is logged and leaves forwarding disabled for
+// this run rather than failing proxy startup.
+func New(cfg config.StatementForwardingConfig, queueDBPath string) *Forwarder {
 	f := &Forwarder{
 		cfg:    cfg,
-		queue:  make(chan job, queueCapacity),
 		client: &http.Client{},
 	}
-	if cfg.Enabled && len(cfg.Destinations) > 0 {
-		go f.worker()
-		log.WithFields(log.Fields{
-			"verbs":        cfg.Verbs,
-			"destinations": len(cfg.Destinations),
-		}).Info("Statement forwarding enabled")
+
+	if !cfg.Enabled || len(cfg.Destinations) == 0 {
+		return f
 	}
+
+	f.destByURL = make(map[string]config.ForwardDestination, len(cfg.Destinations))
+	for _, d := range cfg.Destinations {
+		f.destByURL[d.URL] = d
+	}
+
+	store, err := OpenStore(queueDBPath)
+	if err != nil {
+		log.WithError(err).WithField("path", queueDBPath).
+			Error("statement forwarding: failed to open durable queue - forwarding disabled for this run")
+		return f
+	}
+	f.store = store
+
+	go f.worker()
+	log.WithFields(log.Fields{
+		"verbs":        cfg.Verbs,
+		"destinations": len(cfg.Destinations),
+		"queue_db":     queueDBPath,
+	}).Info("Statement forwarding enabled")
+
 	return f
 }
 
-// MaybeForward enqueues statement for delivery if its verb is on the
-// allowlist. Called once per statement, after the LRS write for the batch it
-// belonged to has already succeeded. Never blocks the caller: a full queue
-// drops the statement (logged), rather than backing up statement writes.
+// MaybeForward enqueues statement for delivery, once per configured
+// destination, if its verb is on the allowlist. Called once per statement,
+// after the LRS write for the batch it belonged to has already succeeded.
+// Never blocks meaningfully or fails the caller: an enqueue failure (queue
+// file unwritable) is logged, not propagated - same "forwarding is a side
+// effect" philosophy as everywhere else in this package.
 func (f *Forwarder) MaybeForward(tenantID, verbID string, statement json.RawMessage) {
-	if f == nil || !f.cfg.Enabled || len(f.cfg.Destinations) == 0 {
+	if f == nil || f.store == nil {
 		return
 	}
 	if verbID == "" || !f.verbAllowed(verbID) {
 		return
 	}
 
-	select {
-	case f.queue <- job{tenantID: tenantID, verbID: verbID, statement: statement}:
-	default:
-		log.WithFields(log.Fields{
-			"tenant_id": tenantID,
-			"verb_id":   verbID,
-		}).Error("statement forward queue is full - dropping statement, listener may be down or falling behind")
+	for _, dest := range f.cfg.Destinations {
+		if err := f.store.Enqueue(tenantID, verbID, dest.URL, statement); err != nil {
+			log.WithError(err).WithFields(log.Fields{
+				"tenant_id": tenantID,
+				"verb_id":   verbID,
+				"dest":      dest.URL,
+			}).Error("statement forwarding: failed to enqueue statement, it will NOT be delivered")
+		}
 	}
 }
 
@@ -102,27 +141,66 @@ func (f *Forwarder) verbAllowed(verbID string) bool {
 	return false
 }
 
-// worker drains the queue sequentially, delivering each job to every
-// configured destination before moving to the next. Single-worker by design:
-// keeps delivery roughly ordered and avoids hammering the listener, at the
-// cost of a slow/unreachable listener backing up the queue (see queueCapacity).
+// worker polls the durable queue, attempting every job that's currently due
+// (pending, and past any backoff window from a prior failed attempt) once
+// per pass, then sleeps if the pass found nothing to do. Unlike the old
+// in-memory version, a job that's backing off does not block delivery of
+// other, unrelated jobs behind it — see Store.RecordFailure.
 func (f *Forwarder) worker() {
-	for j := range f.queue {
-		for _, dest := range f.cfg.Destinations {
-			f.deliverWithRetry(dest, j)
+	defer f.store.Close()
+
+	pruneTicker := time.NewTicker(pruneInterval)
+	defer pruneTicker.Stop()
+
+	for {
+		select {
+		case <-pruneTicker.C:
+			if n, err := f.store.PruneDelivered(pruneRetention); err != nil {
+				log.WithError(err).Error("statement forwarding: failed to prune delivered rows")
+			} else if n > 0 {
+				log.WithField("rows", n).Info("statement forwarding: pruned old delivered rows")
+			}
+		default:
+		}
+
+		jobs, err := f.store.ClaimPending(claimBatchSize)
+		if err != nil {
+			log.WithError(err).Error("statement forwarding: failed to read pending queue")
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		if len(jobs) == 0 {
+			time.Sleep(pollInterval)
+			continue
+		}
+
+		for _, j := range jobs {
+			f.deliverOne(j)
 		}
 	}
 }
 
-func (f *Forwarder) deliverWithRetry(dest config.ForwardDestination, j job) {
+func (f *Forwarder) deliverOne(j QueuedJob) {
+	dest, ok := f.destByURL[j.DestURL]
+	if !ok {
+		// The destination was removed from config since this row was
+		// queued. Nothing will ever pick this up again if left pending -
+		// mark it failed outright rather than retrying forever.
+		log.WithField("dest", j.DestURL).Warn("statement forwarding: queued job's destination is no longer configured, giving up on it")
+		_ = f.store.RecordFailure(j.ID, j.Attempts+1, j.Attempts+1, 0, "destination no longer configured")
+		return
+	}
+
 	envelope := map[string]interface{}{
-		"tenant_id": j.tenantID,
-		"verb_id":   j.verbID,
-		"statement": j.statement,
+		"tenant_id": j.TenantID,
+		"verb_id":   j.VerbID,
+		"statement": json.RawMessage(j.Statement),
 	}
 	body, err := json.Marshal(envelope)
 	if err != nil {
 		log.WithError(err).Error("statement forwarding: failed to marshal envelope, dropping")
+		_ = f.store.RecordFailure(j.ID, j.Attempts+1, j.Attempts+1, 0, "failed to marshal envelope: "+err.Error())
 		return
 	}
 
@@ -133,24 +211,26 @@ func (f *Forwarder) deliverWithRetry(dest config.ForwardDestination, j job) {
 		maxAttempts = 1
 	}
 
-	var lastErr error
-	for attempt := 1; attempt <= maxAttempts; attempt++ {
-		if err := f.attemptDelivery(dest, body, timeout); err != nil {
-			lastErr = err
-			if attempt < maxAttempts {
-				time.Sleep(backoff * time.Duration(attempt)) // linear backoff
-			}
-			continue
+	attempts := j.Attempts + 1
+
+	if err := f.attemptDelivery(dest, body, timeout); err != nil {
+		if recErr := f.store.RecordFailure(j.ID, attempts, maxAttempts, backoff, err.Error()); recErr != nil {
+			log.WithError(recErr).Error("statement forwarding: failed to record delivery failure")
 		}
-		return // delivered
+		if attempts >= maxAttempts {
+			log.WithFields(log.Fields{
+				"url":      dest.URL,
+				"verb_id":  j.VerbID,
+				"attempts": attempts,
+				"error":    err,
+			}).Error("statement forwarding failed after all retries - statement was NOT delivered to the listener")
+		}
+		return
 	}
 
-	log.WithFields(log.Fields{
-		"url":      dest.URL,
-		"verb_id":  j.verbID,
-		"attempts": maxAttempts,
-		"error":    lastErr,
-	}).Error("statement forwarding failed after all retries - statement was NOT delivered to the listener")
+	if err := f.store.MarkDelivered(j.ID); err != nil {
+		log.WithError(err).Error("statement forwarding: delivered successfully but failed to record it - may retry needlessly")
+	}
 }
 
 func (f *Forwarder) attemptDelivery(dest config.ForwardDestination, body []byte, timeout time.Duration) error {
