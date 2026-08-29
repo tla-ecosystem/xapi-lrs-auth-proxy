@@ -251,7 +251,19 @@ func (v *PermissionValidator) ValidateStateAccess(claims *models.Claims, activit
 		if activityID != claims.ActivityID {
 			return fmt.Errorf("state access denied: activity mismatch")
 		}
-		if registration != claims.Registration {
+		// registration is only checked when the caller actually sent one.
+		// Unlike the cmi5-mandated LMS.LaunchData read (which cmi5.js always
+		// sends with a registration param), generic State/Agent-Profile
+		// calls a driver makes for its own bookkeeping (language
+		// preference, bookmarking/"status", etc.) commonly omit it - that's
+		// valid per the xAPI State Resource spec, registration there is
+		// optional context, not a required match key. Treating an absent
+		// registration as claims.Registration ("" != a real GUID) rejected
+		// every one of those calls with a false "registration mismatch"
+		// 403, even though the JWT itself is already scoped to this exact
+		// actor/activity/registration - matches the "only check if present"
+		// pattern already used by the sibling *Read validators above.
+		if registration != "" && registration != claims.Registration {
 			return fmt.Errorf("state access denied: registration mismatch")
 		}
 	}
