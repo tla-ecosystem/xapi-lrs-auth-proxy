@@ -19,6 +19,26 @@ func NewPermissionValidator(policy string) *PermissionValidator {
 	}
 }
 
+// activityMatches reports whether an observed activity IRI is within the
+// scope of a credential's authorized activityID. An exact match always
+// qualifies; a credential is also authorized for any sub-activity nested
+// under it via a '#fragment' or '/path' suffix. AU-authored interaction
+// statements (answered/interacted) commonly target the AU's own activity ID
+// plus a tool-generated suffix rather than the bare AU activity ID itself -
+// e.g. Storyline's cmi5 export reports quiz questions against
+// "<activityId>#Scene1_Slide2_TrueFalse_0_0". Requiring a byte-for-byte
+// match here denied a registration-scoped AU credential write access to its
+// own interaction statements with "activity mismatch" - confirmed live
+// against a real Storyline cmi5 export on 2026-08-31 (403 on every
+// `answered` statement, queued for retry, later statements never flushing
+// either). See the cmi5 implementation plan.
+func activityMatches(want, got string) bool {
+	if got == want {
+		return true
+	}
+	return strings.HasPrefix(got, want+"#") || strings.HasPrefix(got, want+"/")
+}
+
 // ValidateWrite checks if a statement write is allowed
 func (v *PermissionValidator) ValidateWrite(claims *models.Claims, stmt *models.Statement) error {
 	scope := claims.Permissions.Write
@@ -89,9 +109,10 @@ func (v *PermissionValidator) validateActorActivityRegistration(claims *models.C
 			op, claims.Actor, stmt.Actor)
 	}
 
-	// Activity must match
-	if stmt.Object.ID != claims.ActivityID {
-		return fmt.Errorf("%s denied: activity mismatch (expected %s, got %s)",
+	// Activity must match (exact match, or a sub-activity nested under it -
+	// see activityMatches)
+	if !activityMatches(claims.ActivityID, stmt.Object.ID) {
+		return fmt.Errorf("%s denied: activity mismatch (expected %s or a sub-activity of it, got %s)",
 			op, claims.ActivityID, stmt.Object.ID)
 	}
 
@@ -121,8 +142,9 @@ func (v *PermissionValidator) validateGroupActivityRegistration(claims *models.C
 		return fmt.Errorf("write denied: actor not a member of group")
 	}
 
-	// Activity must match
-	if stmt.Object.ID != claims.ActivityID {
+	// Activity must match (exact match, or a sub-activity nested under it -
+	// see activityMatches)
+	if !activityMatches(claims.ActivityID, stmt.Object.ID) {
 		return fmt.Errorf("write denied: activity mismatch")
 	}
 
@@ -145,9 +167,10 @@ func (v *PermissionValidator) validateActorActivityRegistrationRead(claims *mode
 		}
 	}
 
-	// If activity specified, must match
+	// If activity specified, must match (exact match, or a sub-activity
+	// nested under it - see activityMatches)
 	if activity := query["activity"]; activity != "" {
-		if activity != claims.ActivityID {
+		if !activityMatches(claims.ActivityID, activity) {
 			return fmt.Errorf("read denied: activity mismatch")
 		}
 	}
@@ -195,9 +218,10 @@ func (v *PermissionValidator) validateActorActivityAllRegistrationsRead(claims *
 		}
 	}
 
-	// Activity must match (if specified)
+	// Activity must match (if specified; exact match, or a sub-activity
+	// nested under it - see activityMatches)
 	if activity := query["activity"]; activity != "" {
-		if activity != claims.ActivityID {
+		if !activityMatches(claims.ActivityID, activity) {
 			return fmt.Errorf("read denied: activity mismatch")
 		}
 	}
@@ -212,9 +236,10 @@ func (v *PermissionValidator) validateGroupActivityRegistrationRead(claims *mode
 	// Similar to group write validation
 	// Group member can read group activity data
 
-	// Activity must match (if specified)
+	// Activity must match (if specified; exact match, or a sub-activity
+	// nested under it - see activityMatches)
 	if activity := query["activity"]; activity != "" {
-		if activity != claims.ActivityID {
+		if !activityMatches(claims.ActivityID, activity) {
 			return fmt.Errorf("read denied: activity mismatch")
 		}
 	}
@@ -248,7 +273,7 @@ func (v *PermissionValidator) ValidateStateAccess(claims *models.Claims, activit
 	// Activity must match (for default scope)
 	scope := claims.Permissions.Read
 	if scope == "actor-activity-registration-scoped" {
-		if activityID != claims.ActivityID {
+		if !activityMatches(claims.ActivityID, activityID) {
 			return fmt.Errorf("state access denied: activity mismatch")
 		}
 		// registration is only checked when the caller actually sent one.
